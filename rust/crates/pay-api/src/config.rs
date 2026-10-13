@@ -242,7 +242,7 @@ fn default_push_confirm_timeout_seconds() -> u64 {
 
 /// `/v1/subscriptions/*` config. The cancel handler returns a charge-intent
 /// 402 priced cost-based — `estimated_fee_lamports` defines the SOL cost
-/// the gateway expects to pay for the cancel transaction (typically
+/// the gateway reimburses and the maximum fee it will sponsor (typically
 /// 5_000 lamports per signature × 2 signatures = 10_000), then the
 /// `sol_price_asset` oracle converts that to USDC at challenge time.
 #[derive(Debug, Deserialize, Clone)]
@@ -259,6 +259,10 @@ pub struct SubscriptionsConfig {
     #[serde(default)]
     pub mpp_challenge_binding_secret: Option<String>,
 
+    /// Lamports the USD charge reimburses, and the hard cap on signature
+    /// fees plus caller-set priority fees. The default covers two signatures
+    /// with no priority fee; an omitted CU limit is priced at the runtime
+    /// maximum when validating this cap.
     #[serde(default = "default_cancel_estimated_fee_lamports")]
     pub estimated_fee_lamports: u64,
 

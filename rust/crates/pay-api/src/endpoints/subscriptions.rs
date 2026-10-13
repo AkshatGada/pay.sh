@@ -49,8 +49,9 @@ use tracing::{info, warn};
 
 use crate::state::AppState;
 
+use super::sponsored_fee::{self, COMPUTE_BUDGET_PROGRAM_ID};
+
 const PAYMENT_RECEIPT_HEADER: HeaderName = HeaderName::from_static("payment-receipt");
-const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 
 #[derive(Debug, Deserialize)]
@@ -122,7 +123,8 @@ struct CancelReceiptResponse {
 }
 
 struct ParsedCancelTx {
-    /// The full (partially-signed) transaction the agent submitted.
+    /// Scope-checked and fee-bounded by `parse_cancel_tx`. Keep construction
+    /// private so the signing path only receives validated transactions.
     tx: VersionedTransaction,
     /// Subscriber pubkey extracted from the cancel_subscription
     /// instruction's first account meta.
@@ -343,7 +345,11 @@ fn resolve_cancel_request(
     //     scope, and extract the PDA from its account_metas.
     let (parsed, subscription_pda) = match request.tx.as_deref() {
         Some(tx_b64) if !tx_b64.trim().is_empty() => {
-            let parsed = parse_cancel_tx(tx_b64, &fee_payer_pubkey)?;
+            let parsed = parse_cancel_tx(
+                tx_b64,
+                &fee_payer_pubkey,
+                state.subscriptions.estimated_fee_lamports,
+            )?;
             let pda = parsed.subscription_pda;
             (Some(parsed), pda)
         }
@@ -379,7 +385,11 @@ fn resolve_cancel_request(
 /// `cancel_subscription` on the canonical subscriptions program, plus
 /// optional compute-budget and memo instructions. Everything else is
 /// rejected.
-fn parse_cancel_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCancelTx, Error> {
+fn parse_cancel_tx(
+    tx_b64: &str,
+    expected_fee_payer: &str,
+    max_fee_lamports: u64,
+) -> Result<ParsedCancelTx, Error> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.trim())
@@ -446,6 +456,10 @@ fn parse_cancel_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCance
     let subscriber = resolve(0)?;
     let plan_pda = resolve(1)?;
     let subscription_pda = resolve(2)?;
+
+    // The same configured amount prices the charge and bounds our SOL spend.
+    // Validate before constructing the only type the signing path accepts.
+    sponsored_fee::validate(&tx, max_fee_lamports)?;
 
     Ok(ParsedCancelTx {
         tx,
@@ -724,6 +738,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::{Keypair, Signer as _};
     use solana_transaction::versioned::VersionedTransaction;
 
     fn build_cancel_tx(
@@ -731,6 +746,16 @@ mod tests {
         subscriber: Pubkey,
         plan_pda: Pubkey,
         subscription_pda: Pubkey,
+    ) -> VersionedTransaction {
+        build_cancel_tx_with_instructions(fee_payer, subscriber, plan_pda, subscription_pda, vec![])
+    }
+
+    fn build_cancel_tx_with_instructions(
+        fee_payer: Pubkey,
+        subscriber: Pubkey,
+        plan_pda: Pubkey,
+        subscription_pda: Pubkey,
+        mut instructions: Vec<Instruction>,
     ) -> VersionedTransaction {
         let program_id = Pubkey::from_str(SUBSCRIPTIONS_PROGRAM_ID).unwrap();
         let event_authority = Pubkey::new_unique();
@@ -747,10 +772,11 @@ mod tests {
             ],
             data: vec![INSTRUCTION_CANCEL_SUBSCRIPTION],
         };
+        instructions.push(ix);
         pay_kit::core::tx::build_unsigned_unchecked(
             pay_kit::core::tx::TxVersion::V0,
             &fee_payer,
-            &[ix],
+            &instructions,
             solana_hash::Hash::default(),
             None,
         )
@@ -761,6 +787,190 @@ mod tests {
         pay_kit::core::tx::encode(tx).unwrap()
     }
 
+    fn budget(data: Vec<u8>) -> Instruction {
+        Instruction {
+            program_id: COMPUTE_BUDGET_PROGRAM_ID.parse().unwrap(),
+            accounts: vec![],
+            data,
+        }
+    }
+
+    fn unit_limit(limit: u32) -> Instruction {
+        budget([vec![2], limit.to_le_bytes().to_vec()].concat())
+    }
+
+    fn unit_price(price: u64) -> Instruction {
+        budget([vec![3], price.to_le_bytes().to_vec()].concat())
+    }
+
+    fn cancel_with_budget(instructions: Vec<Instruction>) -> VersionedTransaction {
+        build_cancel_tx_with_instructions(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            instructions,
+        )
+    }
+
+    fn parse_with_cap(tx: &VersionedTransaction, cap: u64) -> Result<ParsedCancelTx, Error> {
+        parse_cancel_tx(
+            &encode_tx(tx),
+            &tx.message.static_account_keys()[0].to_string(),
+            cap,
+        )
+    }
+
+    #[test]
+    fn parse_cancel_tx_rejects_priority_fee_drain() {
+        // 12.6 SOL priority fee, despite a small fixed reimbursement.
+        let subscriber = Keypair::new();
+        let mut tx = build_cancel_tx_with_instructions(
+            Pubkey::new_unique(),
+            subscriber.pubkey(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            vec![unit_limit(1_400_000), unit_price(9_000_000_000)],
+        );
+        let subscriber_index = tx
+            .message
+            .static_account_keys()
+            .iter()
+            .position(|key| key == &subscriber.pubkey())
+            .unwrap();
+        tx.signatures[subscriber_index] = subscriber.sign_message(&tx.message.serialize());
+        assert!(tx.verify_with_results()[subscriber_index]);
+        assert_eq!(
+            sponsored_fee::sponsored_fee_lamports(&tx).unwrap(),
+            12_600_010_000
+        );
+        assert!(parse_with_cap(&tx, 50_000).is_err());
+    }
+
+    #[test]
+    fn parse_cancel_tx_default_cap_only_covers_two_signature_base_fee() {
+        let cap = crate::config::SubscriptionsConfig::default().estimated_fee_lamports;
+        assert_eq!(cap, 10_000);
+        assert!(parse_with_cap(&cancel_with_budget(vec![]), cap).is_ok());
+        for instructions in [
+            vec![unit_limit(1), unit_price(1)],
+            vec![unit_price(1)],
+            vec![unit_limit(200_000), unit_price(1)],
+        ] {
+            assert!(parse_with_cap(&cancel_with_budget(instructions), cap).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_cancel_tx_enforces_exact_total_fee_boundaries() {
+        for (instructions, fee) in [
+            (vec![], 10_000),
+            (vec![unit_limit(50_000)], 10_000),
+            (vec![unit_price(0)], 10_000),
+            (vec![unit_limit(0), unit_price(u64::MAX)], 10_000),
+            (vec![unit_limit(1), unit_price(1)], 10_001),
+            (vec![unit_limit(50_000), unit_price(1_000_001)], 60_001),
+            (vec![unit_limit(u32::MAX), unit_price(1_000_000)], 1_410_000),
+            // With no explicit limit, price the full runtime maximum.
+            (vec![unit_price(1_000_000)], 1_410_000),
+        ] {
+            let tx = cancel_with_budget(instructions);
+            assert!(parse_with_cap(&tx, fee - 1).is_err());
+            let parsed = parse_with_cap(&tx, fee).unwrap();
+            assert_eq!(parsed.tx, tx);
+            assert!(parse_with_cap(&tx, fee + 1).is_ok());
+        }
+    }
+
+    #[test]
+    fn parse_cancel_tx_rejects_ambiguous_or_unsupported_budgets() {
+        let mut budget_with_account = unit_limit(50_000);
+        budget_with_account
+            .accounts
+            .push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
+        for instructions in [
+            vec![budget(vec![])],
+            vec![budget(vec![0, 0, 0, 0, 0, 0, 0, 0, 0])],
+            vec![budget(vec![1, 0, 0, 1, 0])],
+            vec![budget(vec![4, 0, 0, 1, 0])],
+            vec![budget(vec![255])],
+            vec![budget(vec![2, 0, 0, 0])],
+            vec![budget(vec![2, 0, 0, 0, 0, 0])],
+            vec![budget(vec![3, 0, 0, 0, 0, 0, 0, 0])],
+            vec![budget(vec![3, 0, 0, 0, 0, 0, 0, 0, 0, 0])],
+            vec![unit_limit(0), unit_limit(50_000)],
+            vec![unit_price(0), unit_price(1)],
+            vec![budget_with_account],
+            vec![unit_limit(1_400_000), unit_price(u64::MAX)],
+            vec![unit_price(u64::MAX)],
+        ] {
+            let tx = cancel_with_budget(instructions);
+            assert!(parse_with_cap(&tx, u64::MAX).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_cancel_tx_prices_budgets_in_any_order() {
+        // The runtime processes budgets regardless of position. Check every
+        // permutation, including budgets after cancel and between memos.
+        let memo = Instruction {
+            program_id: MEMO_PROGRAM_ID.parse().unwrap(),
+            accounts: vec![],
+            data: b"cancel".to_vec(),
+        };
+        let original = cancel_with_budget(vec![unit_limit(50_000), memo, unit_price(1_000_000)]);
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a, b, c, d];
+                        if (0..4).any(|i| order[..i].contains(&order[i])) {
+                            continue;
+                        }
+                        let mut tx = original.clone();
+                        let solana_message::VersionedMessage::V0(message) = &mut tx.message else {
+                            panic!("expected v0");
+                        };
+                        message.instructions = order
+                            .map(|i| original.message.instructions()[i].clone())
+                            .to_vec();
+                        assert!(parse_with_cap(&tx, 59_999).is_err());
+                        assert!(parse_with_cap(&tx, 60_000).is_ok());
+                    }
+                }
+            }
+        }
+        let mut tx = cancel_with_budget(vec![unit_price(0), unit_price(1)]);
+        let solana_message::VersionedMessage::V0(message) = &mut tx.message else {
+            panic!("expected v0");
+        };
+        message.instructions.swap(1, 2); // duplicate separated by cancel
+        assert!(parse_with_cap(&tx, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn parse_cancel_tx_counts_all_signatures_and_rejects_precompiles() {
+        let memo = Instruction {
+            program_id: MEMO_PROGRAM_ID.parse().unwrap(),
+            accounts: vec![AccountMeta::new_readonly(Pubkey::new_unique(), true)],
+            data: b"extra signer".to_vec(),
+        };
+        let tx = cancel_with_budget(vec![memo]);
+        assert!(parse_with_cap(&tx, 14_999).is_err());
+        assert!(parse_with_cap(&tx, 15_000).is_ok());
+        for program in [
+            "Ed25519SigVerify111111111111111111111111111",
+            "KeccakSecp256k11111111111111111111111111111",
+        ] {
+            let tx = cancel_with_budget(vec![Instruction {
+                program_id: program.parse().unwrap(),
+                accounts: vec![],
+                data: vec![1],
+            }]);
+            assert!(parse_with_cap(&tx, u64::MAX).is_err());
+        }
+    }
+
     #[test]
     fn parse_cancel_tx_extracts_subscriber_plan_and_subscription() {
         let fee_payer = Pubkey::new_unique();
@@ -768,7 +978,7 @@ mod tests {
         let plan = Pubkey::new_unique();
         let sub = Pubkey::new_unique();
         let tx = build_cancel_tx(fee_payer, subscriber, plan, sub);
-        let parsed = parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).unwrap();
+        let parsed = parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string(), 10_000).unwrap();
         assert_eq!(parsed.subscriber, subscriber);
         assert_eq!(parsed.plan_pda, plan);
         assert_eq!(parsed.subscription_pda, sub);
@@ -785,7 +995,7 @@ mod tests {
             Pubkey::new_unique(),
         );
         // Submitting an imposter pubkey as the expected fee payer must fail.
-        assert!(parse_cancel_tx(&encode_tx(&tx), &imposter.to_string()).is_err());
+        assert!(parse_cancel_tx(&encode_tx(&tx), &imposter.to_string(), 10_000).is_err());
     }
 
     #[test]
@@ -799,7 +1009,7 @@ mod tests {
         );
         tx.signatures.clear();
 
-        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
+        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string(), 10_000).is_err());
     }
 
     #[test]
@@ -833,7 +1043,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
+        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string(), 10_000).is_err());
     }
 
     #[test]
@@ -854,7 +1064,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
+        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string(), 10_000).is_err());
     }
 
     #[test]
@@ -881,7 +1091,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
+        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string(), 10_000).is_err());
     }
 
     #[test]

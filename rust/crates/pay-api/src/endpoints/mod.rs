@@ -4,6 +4,7 @@ pub mod onramp;
 pub mod receipt;
 pub mod redeem;
 pub mod send;
+mod sponsored_fee;
 pub mod stablecoin_balances;
 pub mod subscriptions;
 /// Kept compiled while billing and caller authentication are completed, but
