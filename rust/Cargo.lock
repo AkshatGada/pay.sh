@@ -5302,6 +5302,7 @@ dependencies = [
 name = "pay-keystore"
 version = "0.30.0"
 dependencies = [
+ "base64 0.22.1",
  "bs58",
  "secret-service",
  "serde",

@@ -8,6 +8,7 @@
 
 pub mod auth;
 mod error;
+mod status;
 pub mod store;
 
 #[cfg(target_os = "linux")]
@@ -243,7 +244,7 @@ impl Keystore {
         validate_keypair(keypair_bytes)?;
 
         if self.auth_on_write {
-            self.auth.authenticate(intent)?;
+            self.gate(intent)?;
         }
 
         self.store.store(&keypair_key(account), keypair_bytes)?;
@@ -266,7 +267,7 @@ impl Keystore {
     pub fn delete_with_intent(&self, account: &str, intent: &AuthIntent) -> Result<()> {
         validate_account_name(account)?;
         if self.auth_on_write {
-            self.auth.authenticate(intent)?;
+            self.gate(intent)?;
         }
 
         self.store.delete(&keypair_key(account))?;
@@ -294,7 +295,7 @@ impl Keystore {
         intent: &AuthIntent,
     ) -> Result<Zeroizing<Vec<u8>>> {
         validate_account_name(account)?;
-        self.auth.authenticate(intent)?;
+        self.gate(intent)?;
         let keypair = self.store.load(&keypair_key(account))?;
         validate_keypair(&keypair)?;
         Ok(keypair)
@@ -322,7 +323,7 @@ impl Keystore {
         }
 
         if self.auth_on_write {
-            self.auth.authenticate(intent)?;
+            self.gate(intent)?;
         }
 
         self.store.store(&credential_key(account), credential)
@@ -335,7 +336,7 @@ impl Keystore {
         intent: &AuthIntent,
     ) -> Result<Zeroizing<Vec<u8>>> {
         validate_account_name(account)?;
-        self.auth.authenticate(intent)?;
+        self.gate(intent)?;
         self.store.load(&credential_key(account))
     }
 
@@ -348,7 +349,7 @@ impl Keystore {
     pub fn delete_credential_with_intent(&self, account: &str, intent: &AuthIntent) -> Result<()> {
         validate_account_name(account)?;
         if self.auth_on_write {
-            self.auth.authenticate(intent)?;
+            self.gate(intent)?;
         }
         self.store.delete(&credential_key(account))
     }
@@ -360,12 +361,20 @@ impl Keystore {
 
     /// Authenticate without loading anything using a typed auth intent.
     pub fn authenticate_intent(&self, intent: &AuthIntent) -> Result<()> {
-        self.auth.authenticate(intent)
+        self.gate(intent)
     }
 
     /// Check if the auth mechanism is available.
     pub fn auth_available(&self) -> bool {
         self.auth.is_available()
+    }
+
+    fn gate(&self, intent: &AuthIntent) -> Result<()> {
+        let _status = self
+            .auth
+            .prompts_user()
+            .then(|| status::Blocked::new(intent));
+        self.auth.authenticate(intent)
     }
 }
 

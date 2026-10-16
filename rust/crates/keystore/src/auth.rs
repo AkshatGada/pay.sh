@@ -618,6 +618,11 @@ pub trait AuthGate: Send + Sync {
 
     /// Check if this auth mechanism is available on the current device.
     fn is_available(&self) -> bool;
+
+    /// Whether [`authenticate`](Self::authenticate) waits on the user.
+    fn prompts_user(&self) -> bool {
+        true
+    }
 }
 
 /// No authentication — always succeeds. Used for testing and backends
@@ -631,6 +636,10 @@ impl AuthGate for NoAuth {
 
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn prompts_user(&self) -> bool {
+        false
     }
 }
 
