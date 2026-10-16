@@ -8,6 +8,7 @@
 pub mod channel;
 pub mod config;
 pub mod error;
+pub mod rent_recovery;
 pub mod resource_cleanup;
 pub mod signer;
 pub mod telemetry;

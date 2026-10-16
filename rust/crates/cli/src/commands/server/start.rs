@@ -135,7 +135,17 @@ impl ConfiguredSessionStore {
         config: pay_kit::mpp::server::session::SessionConfig,
         secret: &str,
     ) -> pay_core::Result<SessionMpp> {
+        config
+            .channel_deployment()
+            .map_err(|error| pay_core::Error::Config(error.to_string()))?;
         match self {
+            Self::Static { durable: false, .. } if config.channel_version == Some(2) => {
+                Err(pay_core::Error::Config(
+                    "V2 MPP sessions require durable Redis storage; set PAY_MPP_REDIS_URL or \
+                     PAY_SESSION_REDIS_URL and build with redis-session-store"
+                        .into(),
+                ))
+            }
             Self::Static { store, .. } => Ok(SessionMpp::new_with_channel_store(
                 config,
                 secret,
@@ -1528,6 +1538,9 @@ impl StartCommand {
 
         let op = api.operator.clone();
         let op = op.as_ref();
+        if let Some(operator) = op {
+            pay_core::credit_provider::validate_operator(operator)?;
+        }
 
         // Note: we used to refuse any `operator.signer` block unless the
         // `gcp_kms` feature was built. That was over-broad — the new
@@ -1841,12 +1854,18 @@ impl StartCommand {
                 fee_payer,
                 fee_payer_signer.clone(),
                 &blockhash_cache,
+                api.endpoints.iter().any(|endpoint| {
+                    endpoint.metering.as_ref().is_some_and(|meter| {
+                        meter
+                            .accepted_schemes()
+                            .contains(&pay_types::metering::Scheme::MppCharge)
+                    })
+                }),
             )?;
             // ── Create one session MPP server per configured currency ──
             let session_mpps: Vec<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
                 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
                 use pay_types::metering::SessionVoucherSigner as ConfigVoucherSigner;
-                use std::str::FromStr;
 
                 ensure_session_currencies_usd_pegged(
                     &currency_configs,
@@ -1874,10 +1893,13 @@ impl StartCommand {
 
                 let session_secret = std::env::var("PAY_MPP_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
-                let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
-                    .ok()
-                    .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
-                    .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
+                let (channel_program_id, channel_version, channel_hooks) =
+                    pay_core::mpp_channel_profile::server_profile()?;
+                if channel_version == Some(2) && sess.reuse_from_chain {
+                    return Err(pay_core::Error::Config(
+                        "V2 sessions require durable store recovery; disable session.reuse_from_chain".into(),
+                    ));
+                }
                 let session_splits = resolve_session_splits(&api, sess)?;
                 let voucher_signer = match sess.voucher_signer {
                     ConfigVoucherSigner::Client => VoucherSigner::Client,
@@ -1969,6 +1991,8 @@ impl StartCommand {
                             pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                         rpc_url: Some(rpc_url.clone()),
                         channel_program: Some(channel_program_id),
+                        channel_version,
+                        channel_hooks: channel_hooks.clone(),
                         token_program: Some(token_program),
                     };
 
@@ -3951,10 +3975,13 @@ async fn gateway_verify(
             };
             let mut last_error = None;
             for mpp in &mpps {
+                use pay_core::mpp_channel_profile::charge_with_options;
+
                 // Audit #2: verify against the request this route would issue
                 // (rebuilt from the gateway's own price + splits), not the
                 // values echoed in the client's credential.
-                let expected: pay_kit::mpp::ChargeRequest = match mpp.charge_with_options(
+                let expected: pay_kit::mpp::ChargeRequest = match charge_with_options(
+                    mpp,
                     &req.price,
                     pay_kit::mpp::server::ChargeOptions {
                         description: req.description.as_deref(),
@@ -4068,7 +4095,8 @@ fn gateway_charge_challenges(
 ) -> Result<Vec<pay_kit::mpp::PaymentChallenge>, pay_kit::mpp::Error> {
     mpps.iter()
         .map(|mpp| {
-            mpp.charge_with_options(
+            pay_core::mpp_channel_profile::charge_with_options(
+                mpp,
                 &req.price,
                 pay_kit::mpp::server::ChargeOptions {
                     description: req.description.as_deref(),
@@ -4130,6 +4158,16 @@ mod tests {
             static_store.reconciliation(),
             super::SessionLifecycleReconciliation::Embedded
         );
+        let mut config = pay_kit::mpp::server::session::SessionConfig::default();
+        assert!(static_store.session(config.clone(), "test-secret").is_ok());
+        config.channel_version = Some(2);
+        config.channel_program = Some(
+            Pubkey::from_str(pay_kit::core::payment_channel::v2::PAYMENT_CHANNELS_PROGRAM_ID)
+                .unwrap(),
+        );
+        config.network = "devnet".into();
+        let error = static_store.session(config, "test-secret").err().unwrap();
+        assert!(error.to_string().contains("PAY_MPP_REDIS_URL"));
         assert!(missing_deployment_store.is_err());
         assert!(invalid_deployment_store.is_err());
     }

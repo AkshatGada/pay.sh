@@ -2154,6 +2154,8 @@ mod tests {
             method_details: SessionMethodDetails {
                 network: "localnet".to_string(),
                 channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
+                channel_version: None,
+                channel_hooks: None,
                 channel_id: None,
                 transaction_versions: None,
                 recent_blockhash: Some("11111111111111111111111111111111".to_string()),

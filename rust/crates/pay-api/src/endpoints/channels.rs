@@ -425,6 +425,7 @@ fn build_charge_request(
         external_id: Some(resolved.channel.to_string()),
         method_details: Some(
             serde_json::to_value(MethodDetails {
+                channel_charge: None,
                 network: Some(resolved.cluster.to_string()),
                 decimals: Some(resolved.coin.decimals),
                 token_program: Some(resolved.coin.token_program.to_string()),

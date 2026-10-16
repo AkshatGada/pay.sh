@@ -1,15 +1,16 @@
 //! Channel decoding, distribution-preimage recovery, and instruction building
 //! for the payment-channels program.
 //!
-//! Reuses pay-kit's Codama-generated [`Channel`] account (borsh-decoded via
-//! `Channel::from_bytes`) and its instruction builders, plus pay-api-core's
-//! ATA derivation and RPC client.
+//! Bound sessions use pay-kit's ownership-aware, versioned decoder. Existing
+//! fleet jobs remain V1-only and reject V2 rather than decoding its V1 prefix.
+//! ATA derivation and RPC access come from pay-api-core.
 
 use std::str::FromStr;
 
 use pay_api_core::ata::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, associated_token_address};
 use pay_api_core::rpc::RpcClient;
 use pay_kit::core::payment_channels::{default_program_id, find_event_authority_pda, to_address};
+use pay_kit::core::payment_channels_v2::Deployment;
 use pay_kit::generated::payment_channels::generated::accounts::Channel;
 use pay_kit::generated::payment_channels::generated::instructions::{
     DistributeBuilder, OPEN_DISCRIMINATOR, ReclaimBuilder, RequestCloseBuilder, SealBuilder,
@@ -18,6 +19,7 @@ use pay_kit::generated::payment_channels::generated::instructions::{
 use pay_kit::generated::payment_channels::generated::types::{
     DistributeArgs, DistributionEntry, SettleAndSealArgs, TopUpArgs,
 };
+use pay_kit::mpp::server::session::SessionConfig;
 use sha2::{Digest, Sha256};
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -179,7 +181,7 @@ pub async fn fetch_channel(
         .flatten())
 }
 
-/// Fetch a channel using its immutable session program, not the fleet default.
+/// Fetch a V1 channel using an explicit program. V2 requires `fetch_session_channel`.
 pub async fn fetch_channel_for_program(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -195,12 +197,90 @@ pub async fn fetch_channel_for_program(
     if account.owner != program_id.to_string() {
         return Err(JobError::Config("session channel program mismatch".into()));
     }
-    Ok(Channel::from_bytes(&account.data)
+    decode_v1_channel(address, &account.data)
+}
+
+/// Validate persisted ABI selection before any recovery or transaction building.
+pub fn session_deployment(config: &SessionConfig) -> Result<Deployment, JobError> {
+    config
+        .channel_deployment()
+        .map_err(|error| JobError::Config(format!("session deployment: {error}")))
+}
+
+/// Ownership and immutable hook configuration must both match the snapshot.
+pub fn decode_session_channel(
+    address: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+    config: &SessionConfig,
+) -> Result<DecodedChannel, JobError> {
+    let decoded = session_deployment(config)?
+        .decode_account(owner, data)
+        .map_err(|error| JobError::Config(format!("session channel: {error}")))?;
+    if decoded.hooks != config.channel_hooks.clone().unwrap_or_default() {
+        return Err(JobError::Config(
+            "session channel hooks differ from snapshot".into(),
+        ));
+    }
+    Ok(DecodedChannel {
+        address: *address,
+        channel: decoded.channel,
+    })
+}
+
+pub async fn fetch_session_channel(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    config: &SessionConfig,
+) -> Result<Option<DecodedChannel>, JobError> {
+    let deployment = session_deployment(config)?;
+    if deployment.version == 1 {
+        // Preserve V1 tombstone handling, but still reject a V2 prefix.
+        return fetch_channel_for_program(rpc, rpc_url, address, &deployment.program_id).await;
+    }
+    let accounts = rpc
+        .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
+        .await?;
+    let Some(account) = accounts.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let owner =
+        Pubkey::from_str(&account.owner).map_err(|_| JobError::InvalidAddress(account.owner))?;
+    decode_session_channel(address, &owner, &account.data, config).map(Some)
+}
+
+fn decode_v1_channel(address: &Pubkey, data: &[u8]) -> Result<Option<DecodedChannel>, JobError> {
+    // Codama's V1 decoder accepts a V2 prefix. Never infer V1 from that success.
+    if data.get(1) == Some(&2)
+        || data.len() == pay_kit::core::payment_channels_v2::CHANNEL_ACCOUNT_SIZE
+    {
+        return Err(JobError::Config(
+            "V2 channel requires a persisted session deployment and hooks; V1 recovery is unsupported".into(),
+        ));
+    }
+    Ok(Channel::from_bytes(data)
         .ok()
         .map(|channel| DecodedChannel {
             address: *address,
             channel,
         }))
+}
+
+fn decode_v1_account(
+    address: &Pubkey,
+    owner: &str,
+    data: &[u8],
+) -> Result<Option<DecodedChannel>, JobError> {
+    if owner == pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID {
+        return Err(JobError::Config(
+            "V2 channel is unsupported by the V1/batch worker path".into(),
+        ));
+    }
+    if owner != default_program_id().to_string() {
+        return Ok(None);
+    }
+    decode_v1_channel(address, data)
 }
 
 /// Fetch and decode up to 100 channels with one `getMultipleAccounts` call.
@@ -218,7 +298,6 @@ pub async fn fetch_channels(
             addresses.len()
         )));
     }
-    let program_id = default_program_id();
     let accounts = rpc
         .get_multiple_accounts_with_owner(
             rpc_url,
@@ -228,19 +307,19 @@ pub async fn fetch_channels(
                 .collect::<Vec<_>>(),
         )
         .await?;
-    Ok(addresses
+    addresses
         .iter()
         .copied()
         .zip(accounts)
         .map(|(address, account)| {
-            let account = account.filter(|account| account.owner == program_id.to_string())?;
+            let Some(account) = account else {
+                return Ok(None);
+            };
             // Tombstoned / closed channels are a different (short) account
             // shape; a decode failure means this is not a live channel.
-            Channel::from_bytes(&account.data)
-                .ok()
-                .map(|channel| DecodedChannel { address, channel })
+            decode_v1_account(&address, &account.owner, &account.data)
         })
-        .collect())
+        .collect()
 }
 
 /// The recovered distribution preimage: the raw `count || entries` bytes that
@@ -290,6 +369,11 @@ pub async fn recover_distribution_preimage(
     rpc_url: &str,
     channel: &DecodedChannel,
 ) -> Result<DistributionPreimage, JobError> {
+    if channel.channel.version != 1 {
+        return Err(JobError::Config(
+            "native distribution recovery is V1-only; V2 requires its persisted snapshot".into(),
+        ));
+    }
     // Empty distribution plans are by far the common case and their preimage
     // is canonical. Avoid two historical RPC reads per channel when the hash
     // itself proves that this is the correct preimage.
@@ -625,6 +709,142 @@ pub fn build_distribute_ix_for_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v2_fixture() -> (SessionConfig, Vec<u8>) {
+        use pay_kit::core::payment_channels_v2::{ChannelHooks, HookDescriptor};
+        let hooks = ChannelHooks {
+            post_distribute: Some(HookDescriptor {
+                program_id: Pubkey::new_unique().to_string(),
+                entrypoint: *b"refund!!",
+                accounts: vec![],
+                static_data: vec![7],
+            }),
+            ..Default::default()
+        };
+        let config = SessionConfig {
+            network: "devnet".into(),
+            channel_program: Some(
+                pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID
+                    .parse()
+                    .unwrap(),
+            ),
+            channel_version: Some(2),
+            channel_hooks: Some(hooks.clone()),
+            ..Default::default()
+        };
+        let mut bytes = vec![0; pay_kit::core::payment_channels_v2::CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 2;
+        bytes[265..297].copy_from_slice(&hooks.config_hash().unwrap());
+        bytes[297..].copy_from_slice(&hooks.encode_fixed().unwrap());
+        (config, bytes)
+    }
+
+    #[test]
+    fn session_decoder_checks_owner_abi_and_persisted_hooks() {
+        let (config, bytes) = v2_fixture();
+        let address = Pubkey::new_unique();
+        let owner = config.channel_program.unwrap();
+        assert_eq!(
+            decode_session_channel(&address, &owner, &bytes, &config)
+                .unwrap()
+                .channel
+                .version,
+            2
+        );
+        assert!(decode_session_channel(&address, &default_program_id(), &bytes, &config).is_err());
+        let mut missing_hooks = config.clone();
+        missing_hooks.channel_hooks = None;
+        assert!(decode_session_channel(&address, &owner, &bytes, &missing_hooks).is_err());
+        let mut mismatch = config.clone();
+        mismatch
+            .channel_hooks
+            .as_mut()
+            .unwrap()
+            .post_distribute
+            .as_mut()
+            .unwrap()
+            .static_data
+            .push(8);
+        assert!(decode_session_channel(&address, &owner, &bytes, &mismatch).is_err());
+        let mut missing_version = config;
+        missing_version.channel_version = None;
+        assert!(decode_session_channel(&address, &owner, &bytes, &missing_version).is_err());
+        assert!(decode_v1_channel(&address, &bytes).is_err());
+        // Batch/fleet reconciliation must report unsupported rather than
+        // treating a V2-owned account as absent and deleting its durable row.
+        assert!(decode_v1_account(&address, &owner.to_string(), &bytes).is_err());
+        assert!(decode_v1_account(&address, &owner.to_string(), &[0]).is_err());
+    }
+
+    #[test]
+    fn unhooked_v2_requires_matching_explicit_deployment_not_some_empty_hooks() {
+        let (mut config, mut bytes) = v2_fixture();
+        config.channel_hooks = None;
+        let empty = pay_kit::core::payment_channels_v2::ChannelHooks::default();
+        bytes[265..297].copy_from_slice(&empty.config_hash().unwrap());
+        bytes[297..].copy_from_slice(&empty.encode_fixed().unwrap());
+        assert!(
+            decode_session_channel(
+                &Pubkey::new_unique(),
+                &config.channel_program.unwrap(),
+                &bytes,
+                &config
+            )
+            .is_ok()
+        );
+        config.channel_program = None;
+        assert!(session_deployment(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn v1_recovery_refuses_v2_before_rpc_even_for_empty_plan() {
+        let (config, bytes) = v2_fixture();
+        let mut channel = decode_session_channel(
+            &Pubkey::new_unique(),
+            &config.channel_program.unwrap(),
+            &bytes,
+            &config,
+        )
+        .unwrap();
+        channel.channel.distribution_hash = Sha256::digest([0; 4]).into();
+        let rpc = RpcClient::new(std::time::Duration::from_millis(10)).unwrap();
+        assert!(matches!(
+            recover_distribution_preimage(&rpc, "http://127.0.0.1:1", &channel).await,
+            Err(JobError::Config(_))
+        ));
+        channel.channel.version = 1;
+        assert!(
+            recover_distribution_preimage(&rpc, "http://127.0.0.1:1", &channel)
+                .await
+                .unwrap()
+                .recipients
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn default_session_keeps_v1_account_layout() {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let address = Pubkey::new_unique();
+        assert_eq!(
+            session_deployment(&SessionConfig::default()).unwrap(),
+            Deployment::default()
+        );
+        assert!(
+            decode_session_channel(
+                &address,
+                &default_program_id(),
+                &bytes,
+                &SessionConfig::default()
+            )
+            .is_ok()
+        );
+        assert!(decode_v1_channel(&address, &bytes).unwrap().is_some());
+        assert!(decode_v1_channel(&address, &[0]).unwrap().is_none());
+    }
 
     #[test]
     fn empty_plan_preimage_hashes_to_zero_count() {

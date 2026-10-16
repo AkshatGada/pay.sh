@@ -29,6 +29,17 @@ pub const SECRET_ENV: &str = "PAY_CONNECT_SELL_SECRET";
 const STABLECOIN_DECIMALS: u8 = 6;
 const BLOCKHASH_REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn validate_session_storage(channel_version: Option<u8>) -> Result<(), String> {
+    if channel_version == Some(2) {
+        return Err(
+            "V2 MPP sessions require durable storage; Connect's memory-backed session \
+             backend does not support V2"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The deployment's signing identity behind every seller's endpoint.
 pub struct Operator {
     pub signer: Arc<dyn TransactionSigner>,
@@ -178,6 +189,9 @@ impl EndpointBackends {
 
         let mut charge = Vec::new();
         if schemes.contains(&Scheme::MppCharge) {
+            let channel_charge =
+                pay_core::mpp_channel_profile::server_charge_config(Some(operator.signer.clone()))
+                    .map_err(|error| error.to_string())?;
             for mint in &mints {
                 let mpp = Mpp::new(pay_kit::mpp::server::Config {
                     recipient: sale.recipient.clone(),
@@ -188,6 +202,7 @@ impl EndpointBackends {
                     challenge_binding_secret: Some(operator.challenge_binding_secret.clone()),
                     fee_payer: true,
                     fee_payer_signer: Some(operator.signer.clone()),
+                    channel_charge: channel_charge.clone(),
                     html: false,
                     ..Default::default()
                 })
@@ -218,6 +233,10 @@ impl EndpointBackends {
             let idle_timeout_seconds = u32::try_from(spec.close_delay_ms.div_ceil(1_000))
                 .unwrap_or(pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS)
                 .clamp(1, pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS);
+            let (channel_program, channel_version, channel_hooks) =
+                pay_core::mpp_channel_profile::server_profile()
+                    .map_err(|error| error.to_string())?;
+            validate_session_storage(channel_version)?;
             for mint in &mints {
                 let token_program = solana_pubkey::Pubkey::from_str(
                     pay_kit::mpp::protocol::solana::default_token_program_for_currency(mint, None),
@@ -244,9 +263,9 @@ impl EndpointBackends {
                     grace_period_seconds:
                         pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                     rpc_url: rpc_url.clone(),
-                    channel_program: Some(
-                        pay_kit::mpp::program::payment_channels::default_program_id(),
-                    ),
+                    channel_program: Some(channel_program),
+                    channel_version,
+                    channel_hooks: channel_hooks.clone(),
                     token_program: Some(token_program),
                 };
                 let session = SessionMpp::new(config, operator.challenge_binding_secret.clone())
@@ -390,6 +409,17 @@ mod tests {
     use pay_core::sell_inference::SellPricing;
 
     const RECIPIENT: &str = "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP";
+
+    #[test]
+    fn connect_memory_sessions_reject_v2_and_preserve_v1() {
+        assert!(validate_session_storage(None).is_ok());
+        assert!(validate_session_storage(Some(1)).is_ok());
+        assert!(
+            validate_session_storage(Some(2))
+                .unwrap_err()
+                .contains("Connect")
+        );
+    }
 
     #[test]
     fn streaming_view_keeps_channel_backends_but_removes_upto() {

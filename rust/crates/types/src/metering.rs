@@ -707,6 +707,13 @@ pub struct EnvRef {
     pub from_env: String,
 }
 
+/// A named credit provider accepted by the merchant across payment intents.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CreditProvider {
+    Coinflow,
+}
+
 /// Operator-level configuration for a proxy instance.
 /// Controls signing, payment recipient, and currency.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -723,6 +730,10 @@ pub struct OperatorConfig {
     /// When present, charge endpoints advertise one challenge per listed currency.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub currencies: std::collections::BTreeMap<String, Vec<String>>,
+    /// Reviewed credit providers, independent of charge/session pricing.
+    /// Selecting an unavailable integration fails startup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credit_providers: Vec<CreditProvider>,
     /// Explicit non-production mints permitted for MPP session benchmarks.
     ///
     /// These mints are never treated as canonical stablecoins. The gateway

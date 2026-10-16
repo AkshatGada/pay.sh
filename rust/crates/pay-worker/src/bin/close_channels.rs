@@ -30,6 +30,7 @@ use pay_worker::channel::{
 };
 use pay_worker::config::Config;
 use pay_worker::error::JobError;
+use pay_worker::rent_recovery;
 use pay_worker::signer::build_fee_payer_signer;
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -245,13 +246,20 @@ async fn run() -> Result<usize, JobError> {
 
     let rpc = RpcClient::new(Duration::from_millis(config.rpc_timeout_ms))?;
     let current_slot = rpc.get_slot(&rpc_url).await?;
-    let addresses = match parse_channel_addresses()? {
+    let explicit_addresses = parse_channel_addresses()?;
+    let automatic_discovery = explicit_addresses.is_none();
+    let addresses = match explicit_addresses {
         Some(addresses) => addresses,
         None => channel::discover_distributed_channels(&rpc, &rpc_url).await?,
     };
 
     let signer = build_fee_payer_signer(&config.send.fee_payer).await?;
     let me = signer.pubkey();
+    let v2_addresses = if automatic_discovery && rent_recovery::enabled(&network) {
+        rent_recovery::discover(&rpc, &rpc_url, &me).await?
+    } else {
+        Vec::new()
+    };
 
     warn!(
         dry_run,
@@ -287,6 +295,50 @@ async fn run() -> Result<usize, JobError> {
     } else {
         None
     };
+
+    // Atomic charges have no SessionConfig. This terminal-state path recovers
+    // only rent; payment settlement still requires its persisted binding.
+    for address in &v2_addresses {
+        let lease = if let Some(url) = redis_url.as_deref().filter(|_| !dry_run) {
+            match ReclaimLease::acquire(url, address).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(error) => {
+                    warn!(channel = %address, %error, "V2 reclaim lease failed");
+                    hard_failures += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        match rent_recovery::fetch_plan(&rpc, &rpc_url, address, &me, current_slot).await {
+            Ok(Some(instruction)) => {
+                reclaim_candidates.push(ChannelInstructionGroup {
+                    channel_id: address.to_string(),
+                    instructions: vec![instruction],
+                });
+                if let Some(lease) = lease {
+                    reclaim_leases.push(lease);
+                }
+            }
+            outcome => {
+                if let Some(lease) = lease {
+                    lease.release().await;
+                }
+                skipped += 1;
+                if let Err(error) = outcome {
+                    warn!(channel = %address, %error, "V2 rent recovery rejected");
+                    if !dry_run {
+                        hard_failures += 1;
+                    }
+                }
+            }
+        }
+    }
 
     for address in &addresses {
         if let Some(store) = &session_store {
@@ -403,7 +455,7 @@ async fn run() -> Result<usize, JobError> {
         acted,
         skipped,
         hard_failures,
-        total = addresses.len(),
+        total = addresses.len() + v2_addresses.len(),
         dry_run,
         "close-channels summary"
     );
@@ -688,6 +740,41 @@ async fn process_reclaim_batches(
     let mut outcome = ReclaimBatchOutcome::default();
 
     for group in pack_reclaim_candidates(tx_version, candidates, &fee_payer) {
+        let mut verified = Vec::new();
+        for candidate in group {
+            if candidate
+                .instructions
+                .iter()
+                .any(|ix| ix.program_id.to_bytes() == rent_recovery::PROGRAM_ID.to_bytes())
+            {
+                let fresh = async {
+                    let address = candidate
+                        .channel_id
+                        .parse()
+                        .map_err(|_| JobError::InvalidAddress(candidate.channel_id.clone()))?;
+                    let slot = rpc.get_slot(rpc_url).await?;
+                    rent_recovery::fetch_plan(rpc, rpc_url, &address, &fee_payer, slot).await
+                }
+                .await;
+                match fresh {
+                    Ok(Some(instruction)) => verified.push(ChannelInstructionGroup {
+                        channel_id: candidate.channel_id,
+                        instructions: vec![instruction],
+                    }),
+                    Ok(None) => {}
+                    Err(error) => {
+                        outcome.failures += 1;
+                        warn!(channel = %candidate.channel_id, %error, "V2 reclaim preflight rejected");
+                    }
+                }
+            } else {
+                verified.push(candidate);
+            }
+        }
+        if verified.is_empty() {
+            continue;
+        }
+        let group = verified;
         let channels: Vec<_> = group
             .iter()
             .map(|candidate| candidate.channel_id.clone())

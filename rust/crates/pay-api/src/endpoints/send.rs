@@ -471,6 +471,7 @@ fn build_charge_request(
     };
 
     let method_details = MethodDetails {
+        channel_charge: None,
         network: Some(resolved.cluster.to_string()),
         decimals: Some(resolved.coin.decimals),
         token_program: Some(resolved.coin.token_program.to_string()),
@@ -1302,6 +1303,7 @@ mod tests {
         .unwrap();
         request.method_details = Some(
             serde_json::to_value(MethodDetails {
+                channel_charge: None,
                 network: Some("mainnet".to_string()),
                 decimals: Some(6),
                 token_program: Some(resolved.coin.token_program.to_string()),

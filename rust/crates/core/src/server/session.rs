@@ -202,6 +202,7 @@ pub struct DelegatedUsageAuthorization {
 #[derive(Clone)]
 struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
+    config: SessionConfig,
     channel_store: Arc<dyn ChannelStore>,
     rpc_url: Option<String>,
     network: String,
@@ -473,8 +474,11 @@ impl SessionOperatorRuntime {
         let Ok(pipeline) = self.transaction_pipeline().await else {
             return false;
         };
+        let Ok(deployment) = self.config.channel_deployment() else {
+            return false;
+        };
         pipeline
-            .read_account_data(channel, None)
+            .read_owned_account_data(channel, None, deployment.program_id)
             .await
             .map(|account| account.is_some_and(|data| data.as_slice() == [2]))
             .unwrap_or(false)
@@ -491,14 +495,19 @@ impl SessionOperatorRuntime {
         }
         let channel = solana_pubkey::Pubkey::from_str(channel_id)
             .map_err(|e| Error::Mpp(format!("invalid payment channel: {e}")))?;
-        use pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel;
+        let deployment = self
+            .config
+            .channel_deployment()
+            .map_err(|error| Error::Mpp(format!("invalid channel deployment: {error}")))?;
         let pipeline = self.transaction_pipeline().await?;
         pipeline
-            .read_account_data(channel, None)
+            .read_owned_account_data(channel, None, deployment.program_id)
             .await
             .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
             .map(|data| {
-                Channel::from_bytes(&data)
+                deployment
+                    .decode_channel(&data)
+                    .map(|state| state.channel)
                     .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
             })
             .transpose()
@@ -523,12 +532,6 @@ impl SessionOperatorRuntime {
             .map(|s| s.pubkey())
             .unwrap_or_else(|| signer.pubkey());
         let tx_pipeline = self.transaction_pipeline().await?;
-        let payer = params
-            .payer
-            .ok_or_else(|| Error::Mpp("payment-channel settlement missing payer".to_string()))?;
-        let mint = params
-            .mint
-            .ok_or_else(|| Error::Mpp("payment-channel settlement missing mint".to_string()))?;
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
             Error::Mpp("payment-channel settlement missing authorized signer".to_string())
         })?;
@@ -575,31 +578,10 @@ impl SessionOperatorRuntime {
                 &params.program_id,
             )
             .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
-        let recipients = params
-            .splits
-            .iter()
-            .map(
-                |split| pay_kit::mpp::program::payment_channels::Distribution {
-                    recipient: split.recipient,
-                    bps: split.bps,
-                },
-            )
-            .collect::<Vec<_>>();
         instructions.push(
-            pay_kit::mpp::program::payment_channels::build_distribute_instruction(
-                &params.channel_id,
-                &payer,
-                // rentPayer must match the channel's stored rent_payer (the
-                // advertised operator / channel payer), NOT the settlement
-                // signer — it's a non-signer account here, so they can differ.
-                &rent_payer,
-                &params.recipient,
-                &treasury,
-                &mint,
-                &recipients,
-                &token_program,
-                &params.program_id,
-            ),
+            params
+                .distribute_instruction(&rent_payer, &treasury, &token_program)
+                .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
         );
 
         // Route through the shared batched worker: concurrent closes pack into
@@ -1571,6 +1553,7 @@ impl SessionMpp {
         let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
         let operator_runtime = SessionOperatorRuntime {
             server: Arc::clone(&server),
+            config: session_config.clone(),
             channel_store,
             rpc_url: session_config.rpc_url.clone(),
             network: session_config.network.clone(),
@@ -1710,6 +1693,7 @@ impl SessionMpp {
         let server = Arc::new(server);
         let mut operator_runtime = self.operator_runtime.clone();
         operator_runtime.server = Arc::clone(&server);
+        operator_runtime.config = config.clone();
         let mut mac = Hmac::<Sha256>::new_from_slice(self.challenge_binding_secret.as_bytes())
             .map_err(|_| Error::Config("invalid challenge binding key".into()))?;
         mac.update(b"pay-deployment-session-v1\0");
@@ -1884,6 +1868,9 @@ impl SessionMpp {
     /// Validate a deployment template before opening the public listener.
     /// Rechecked by `for_deployment_policy` so runtime changes cannot fall back.
     pub fn validate_deployment_template(&self) -> Result<()> {
+        self.session_config
+            .channel_deployment()
+            .map_err(|error| Error::Config(format!("invalid MPP channel deployment: {error}")))?;
         if matches!(self.deployment_store, DeploymentStoreAuthority::Static) {
             return Err(Error::Config(
                 "deployment sessions require a template constructed with DeploymentSessionStore"
@@ -2699,6 +2686,13 @@ impl SessionMpp {
     async fn ensure_channel_loaded(&self, channel_id: &str) -> Result<()> {
         if !self.reuse_from_chain {
             return Ok(());
+        }
+        // V2 requires the immutable off-chain profile binding captured at open.
+        // Recover through the durable store; never invent a binding from chain.
+        if self.session_config.channel_version == Some(2) {
+            return Err(Error::Mpp(
+                "V2 sessions require durable store recovery, not reuse_from_chain".into(),
+            ));
         }
         if self
             .operator_runtime

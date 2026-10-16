@@ -232,6 +232,7 @@ impl SellInference {
                 signer: None,
                 recipient: Some(self.recipient.clone()),
                 currencies: BTreeMap::from([("usd".to_string(), self.currencies.clone())]),
+                credit_providers: vec![],
                 session_benchmark_test_mints: vec![],
                 rpc_url: None,
                 network: Some(self.network.clone()),

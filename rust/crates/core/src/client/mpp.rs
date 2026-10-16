@@ -2,7 +2,10 @@
 //!
 //! Thin wrapper around `pay_kit::mpp` for challenge detection and credential building.
 
-use pay_kit::mpp::client::{BuildChargeTransactionOptions, build_credential_header_with_options};
+use pay_kit::mpp::client::{
+    BuildChargeTransactionOptions, build_channel_charge_credential_with_options,
+    build_credential_header_with_options,
+};
 use pay_kit::mpp::protocol::solana::default_rpc_url;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
@@ -116,6 +119,9 @@ pub fn build_credential_with_override(
         .decode()
         .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
 
+    // Reject untrusted hook descriptors before loading a wallet or asking it
+    // to sign. The SDK checks the same exact descriptor again when building.
+    let channel_hooks = crate::mpp_channel_profile::validate_charge_challenge(&request)?;
     let amount = format_amount(&request.amount, &request.currency);
     let prompt_context = crate::client::prompt::payment_prompt_context(
         charge_prompt_reason(
@@ -210,11 +216,35 @@ pub fn build_credential_with_override(
         max_tx_version: signer.max_tx_version(),
         ..Default::default()
     };
-    let header = rt
-        .block_on(build_credential_header_with_options(
+    let header = if let Some(hooks) = channel_hooks {
+        // A separate ephemeral voucher key avoids asking hardware wallets to
+        // sign arbitrary messages. The payer still signs the complete transaction.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let voucher_signer =
+            pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&key.to_keypair_bytes())
+                .map_err(|error| Error::Mpp(error.to_string()))?;
+        let credential = rt
+            .block_on(build_channel_charge_credential_with_options(
+                &signer,
+                &voucher_signer,
+                challenge,
+                &hooks,
+                rand::random::<u64>(),
+                signer.max_tx_version(),
+            ))
+            .map_err(|error| {
+                Error::Mpp(format!(
+                    "Failed to build channel charge credential: {error}"
+                ))
+            })?;
+        pay_kit::mpp::format_authorization(&credential)
+            .map_err(|error| Error::Mpp(format!("Failed to format credential: {error}")))?
+    } else {
+        rt.block_on(build_credential_header_with_options(
             &signer, &rpc, challenge, options,
         ))
-        .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?;
+        .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?
+    };
 
     Ok((header, ephemeral_notice))
 }

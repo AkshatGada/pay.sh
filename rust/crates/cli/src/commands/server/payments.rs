@@ -626,7 +626,14 @@ pub(crate) fn build_charge_mpps(
     fee_payer: bool,
     fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
+    charge_routes_enabled: bool,
 ) -> pay_core::Result<Vec<Mpp>> {
+    // Session-only V2 deployments do not need a charge payee signer.
+    let channel_charge = if charge_routes_enabled {
+        pay_core::mpp_channel_profile::server_charge_config(fee_payer_signer.clone())?
+    } else {
+        None
+    };
     currency_configs
         .iter()
         .map(|(_, mpp_currency, decimals)| {
@@ -639,6 +646,7 @@ pub(crate) fn build_charge_mpps(
                 challenge_binding_secret: Some(challenge_binding_secret.to_string()),
                 fee_payer,
                 fee_payer_signer: fee_payer_signer.clone(),
+                channel_charge: channel_charge.clone(),
                 html: true,
                 ..Default::default()
             })

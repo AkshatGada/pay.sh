@@ -504,6 +504,7 @@ fn build_charge_request(
     recent_blockhash: Option<String>,
 ) -> Result<MppChargeRequest, Error> {
     let method_details = MethodDetails {
+        channel_charge: None,
         network: Some(resolved.cluster.to_string()),
         decimals: Some(resolved.coin.decimals),
         token_program: Some(resolved.coin.token_program.to_string()),

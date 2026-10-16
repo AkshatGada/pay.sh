@@ -25,17 +25,21 @@ hand-copied program logic or account layout.
 - A transaction is only signed and sent when **`DRY_RUN=false`** is explicitly
   set. Any other value (unset, `true`, `1`, garbage) keeps dry-run on.
 - Always run a dry-run first and read the plan before setting `DRY_RUN=false`.
-- `close-channels` requires an existing, unbound session record before acting
+- The V1 `close-channels` path requires an existing, unbound session record before acting
   when Redis is configured. Missing, malformed, or deployment-bound ownership
   is not permission to adopt a channel discovered on-chain. Live runs require
   Redis; a dry-run without Redis cannot establish ownership.
+- Atomic V2 charges have one narrow exception: automatic discovery on `devnet`
+  or `localnet` can reclaim already-`Distributed` channels whose immutable rent
+  payer is the configured fee-payer signer. No session record is needed for
+  that reclaim-only path; it cannot seal, distribute, fund, or settle a channel.
 
 ## Environment variables
 
 | Var | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `CHANNEL_ADDRESSES` | no | empty | Comma-separated base58 channel pubkeys. Empty scans all on-chain `Distributed` channels for rent reclaim. |
-| `NETWORK` | no | `mainnet` | `mainnet` or `sandbox`; selects the RPC + treasury. |
+| `NETWORK` | no | `mainnet` | Selects the RPC + treasury. `mainnet` and `sandbox` have defaults; `devnet` or `localnet` require `RPC_URL` or a `JOBS_NETWORKS__*__RPC_URL` override and enable V2 rent recovery. |
 | `RPC_URL` | no | per-network YAML | Overrides the RPC URL for the active network (Helius, etc.). |
 | `DRY_RUN` | no | `true` | `false` to actually sign + broadcast. Anything else = dry-run. |
 | `PAY_API_SEND__FEE_PAYER__KEY_NAME` | prod | — | GCP KMS key resource name of the fee payer. |
@@ -105,6 +109,24 @@ account keys consume the available bytes. The deployer schedules the active
 sweep on a cadence longer than the expected job runtime to avoid overlapping
 executions. The Redis lease also rejects an overlapping run, so reclaim work
 survives proxy restarts and does not depend on an in-process timer.
+
+### Atomic V2 charge rent
+
+For scheduled V2 rent recovery, leave `CHANNEL_ADDRESSES` empty, set `NETWORK`
+to `devnet` or `localnet`, and configure its `RPC_URL` and the same fee-payer
+signer that sponsored the charges. Start with `DRY_RUN=true`. Live runs still
+require `PAY_MPP_REDIS_URL` (or `PAY_SESSION_REDIS_URL`) for reclaim leases.
+Explicit address maintenance remains V1-only.
+
+The job scans only the canonical V2 program
+`CHNLxBtXw7VPqd5GMcbtVoEbn4ehyaSoiHj56Ao5sWkJ`, with RPC account-size and
+configured rent-payer filters. The shared RPC wrapper supports one memcmp filter,
+so the worker checks `Distributed` status locally. It verifies owner, layout, version,
+callback guard, status, rent payer, and `current_slot > open_slot + 1500` on a
+fresh account fetch under the lease and again before each reclaim batch.
+Closed accounts are skipped. Reclaim uses the existing native instruction,
+invokes no hooks, and shares the existing transaction-size bounds and dry-run
+behavior. No V2 discovery runs on `mainnet`, `sandbox`, or other network labels.
 
 Non-reclaim state-machine steps remain separate transactions because later
 steps depend on state produced by earlier ones. Each transaction uses the KMS

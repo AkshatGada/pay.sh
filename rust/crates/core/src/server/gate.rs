@@ -657,6 +657,21 @@ impl<S: PaymentState> PaymentGate<S> {
             return GateDecision::Passthrough;
         }
 
+        // Custom PaymentState implementations can bypass CLI startup validation.
+        // Never advertise or process payments for an unavailable credit provider.
+        if let Some(operator) = api.operator.as_ref()
+            && let Err(error) = crate::credit_provider::validate_operator(operator)
+        {
+            return GateDecision::Respond(GateResponse::json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::to_vec(&json!({
+                    "error": "payment_configuration_error",
+                    "message": error.to_string(),
+                }))
+                .unwrap_or_default(),
+            ));
+        }
+
         // ── Gated endpoint ──────────────────────────────────────────────────
         // (Not wired into any adapter yet — the axum middleware still owns these
         // paths — so unimplemented arms below are never reached in production.)
@@ -864,7 +879,8 @@ impl<S: PaymentState> PaymentGate<S> {
                 );
                 let mut challenges = Vec::with_capacity(mpps.len());
                 for mpp in &mpps {
-                    match mpp.charge_with_options(
+                    match crate::mpp_channel_profile::charge_with_options(
+                        mpp,
                         &amount,
                         ChargeOptions {
                             description,
@@ -1720,7 +1736,8 @@ impl<S: PaymentState> PaymentGate<S> {
         for mpp in matching {
             // Audit: verify against the challenge WE would issue (rebuilt from our
             // own price + splits), not the values echoed in the credential.
-            let expected = match mpp.charge_with_options(
+            let expected = match crate::mpp_channel_profile::charge_with_options(
+                mpp,
                 &amount,
                 ChargeOptions {
                     description,

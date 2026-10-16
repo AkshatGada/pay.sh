@@ -214,6 +214,7 @@ fn sandbox_operator(recipient: &str) -> OperatorConfig {
             .into_iter()
             .collect(),
         session_benchmark_test_mints: vec![],
+        credit_providers: vec![],
         rpc_url: None,
         network: Some("localnet".to_string()),
         fee_payer: true,

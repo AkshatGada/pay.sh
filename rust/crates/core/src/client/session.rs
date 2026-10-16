@@ -268,6 +268,7 @@ pub fn check_signer(
         .request
         .decode()
         .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    crate::mpp_channel_profile::validate_challenge(&request)?;
     if request.method_details.voucher_signer == Some(SessionVoucherSigner::Operator) {
         backend.require_raw_message_signing("an operator-signed session proof")?;
     }
@@ -327,6 +328,7 @@ pub fn open_payment_channel_session_header_with_override(
     use pay_kit::mpp::protocol::solana::default_rpc_url;
     use pay_kit::mpp::solana_keychain::MemorySigner;
 
+    crate::mpp_channel_profile::validate_challenge(request)?;
     let details = &request.method_details;
     let network = network_override
         .map(str::to_string)
@@ -633,7 +635,10 @@ mod tests {
             unit_type: Some("request".to_string()),
             method_details: SessionMethodDetails {
                 network: "localnet".to_string(),
-                channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
+                channel_program: pay_kit::mpp::program::payment_channels::default_program_id()
+                    .to_string(),
+                channel_version: None,
+                channel_hooks: None,
                 channel_id: None,
                 recent_blockhash: Some(solana_hash::Hash::new_unique().to_string()),
                 recent_slot: Some(314),
@@ -698,6 +703,25 @@ mod tests {
             panic!("a transactions-only backend cannot sign the session proof");
         };
         assert!(msg.contains("operator-signed session proof"), "{msg}");
+    }
+
+    #[test]
+    fn check_signer_rejects_program_abi_mismatch_before_wallet_capabilities() {
+        use crate::backend::testing::TransactionsOnly;
+        let mut request = test_request();
+        request.method_details.voucher_signer = Some(SessionVoucherSigner::Operator);
+        request.method_details.channel_version = Some(2);
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        let Err(Error::Mpp(message)) = check_signer(&challenge, &TransactionsOnly) else {
+            panic!("an incompatible program must fail before querying wallet capabilities");
+        };
+        assert!(message.contains("channel deployment"), "{message}");
     }
 
     #[test]

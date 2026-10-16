@@ -3,6 +3,7 @@ pub mod accounts;
 mod b58;
 pub mod backend;
 pub mod config;
+pub mod credit_provider;
 pub mod error;
 pub mod explorer;
 pub mod instructions;
@@ -14,6 +15,8 @@ pub mod sell_inference;
 pub mod signer;
 pub mod skills;
 pub mod user_agent;
+
+pub mod mpp_channel_profile;
 
 // Client modules (CLI)
 pub mod client;
