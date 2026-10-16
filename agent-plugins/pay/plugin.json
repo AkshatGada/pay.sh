@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pay",
+  "version": "0.1.0",
+  "description": "Discover priced APIs and pay per request (HTTP 402, x402, MPP) through the hosted Pay MCP server, with the pay workflow skill bundled.",
+  "author": {
+    "name": "Solana Foundation",
+    "url": "https://pay.sh"
+  },
+  "homepage": "https://pay.sh",
+  "repository": "https://github.com/solana-foundation/pay",
+  "license": "MIT",
+  "keywords": ["pay", "payments", "x402", "mpp", "http-402", "stablecoin", "usdc", "solana", "mcp"],
+  "extensions": {
+    "com.nousresearch.hermes": {
+      "servers": {
+        "pay": { "trust": "untrusted" }
+      }
+    }
+  }
+}

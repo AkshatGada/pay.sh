@@ -1,0 +1,29 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pay-cli",
+  "version": "0.1.0",
+  "description": "Discover priced APIs and pay per request (HTTP 402, x402, MPP) from a wallet on this machine through the local `pay mcp` server, with the pay workflow skill bundled.",
+  "author": {
+    "name": "Solana Foundation",
+    "url": "https://pay.sh"
+  },
+  "homepage": "https://pay.sh",
+  "repository": "https://github.com/solana-foundation/pay",
+  "license": "MIT",
+  "keywords": ["pay", "payments", "x402", "mpp", "http-402", "stablecoin", "usdc", "solana", "mcp", "wallet"],
+  "extensions": {
+    "com.nousresearch.hermes": {
+      "servers": {
+        "pay-cli": {
+          "trust": "untrusted",
+          "requires": { "app": true },
+          "app": {
+            "darwin": { "presence": "executable", "location": [{ "kind": "command", "name": "pay" }] },
+            "linux": { "presence": "executable", "location": [{ "kind": "command", "name": "pay" }] },
+            "win32": { "presence": "executable", "location": [{ "kind": "command", "name": "pay" }] }
+          }
+        }
+      }
+    }
+  }
+}
