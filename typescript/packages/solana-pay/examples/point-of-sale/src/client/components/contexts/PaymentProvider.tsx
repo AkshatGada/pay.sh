@@ -135,6 +135,15 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
         }
     }, [status, reference, navigate]);
 
+    // A wallet connection can end before its RPC outcome arrives. Keep that
+    // outcome attached to this pending invoice, but retire it when the invoice
+    // changes, leaves Pending, or the provider unmounts.
+    useEffect(() => {
+        return () => {
+            submissionRef.current = undefined;
+        };
+    }, [status, reference]);
+
     // If there's a connected wallet, use it to sign and send the transaction
     useEffect(() => {
         if (status === PaymentStatus.Pending && reference && connectWallet && walletAddress && txSigner) {
@@ -142,11 +151,11 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
             if (submissionRef.current?.reference !== reference) {
                 submissionRef.current = { reference, submit: createPaymentSubmission() };
             }
-            const submit = submissionRef.current.submit;
+            const attempt = submissionRef.current;
 
             const run = async () => {
                 try {
-                    await submit(
+                    await attempt.submit(
                         async () => {
                             const request = parseURL(url);
                             let compiledTx: ReturnType<typeof compileTransaction>;
@@ -192,7 +201,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
                     );
                 } catch (error) {
                     console.error(error);
-                    if (!changed) {
+                    if (submissionRef.current === attempt) {
                         setSubmissionError(
                             error instanceof PaymentSubmissionError && error.broadcastAttempted
                                 ? 'The payment submission result is unknown. We are still checking for the payment. Check your wallet before starting another payment.'

@@ -478,3 +478,57 @@ test('disconnecting after a payment does not offer another QR payment', async t 
     assert.doesNotMatch(f.rendered(), /fixture QR code|Scan this code/);
     assert.match(f.rendered(), /already approved this payment/);
 });
+
+for (const transactionRequest of [false, true]) {
+    const kind = transactionRequest ? 'transaction request' : 'transfer request';
+    test(`${kind}: disconnecting during a send preserves its later unknown outcome`, async t => {
+        const f = await fixture(t, { outcome: 'lost-response', holdSend: true, transactionRequest });
+        await f.disconnectWallet();
+        await f.finishSend();
+        assert.deepEqual(f.counts, { signs: 1, sends: 1, transfers: 1 });
+        assert.deepEqual(f.balances(), [9_000_000n, 1_000_000n]);
+        assert.match(f.payment().submissionError, /result is unknown/);
+        assert.match(f.rendered(), /Check your wallet/);
+        assert.doesNotMatch(f.rendered(), /fixture QR code|Approve this payment|Connect your wallet to continue/);
+        await f.discover();
+        assert.equal(f.payment().status, 'Valid');
+    });
+}
+
+test('reference discovery still confirms a successful send completed after disconnect', async t => {
+    const f = await fixture(t, { holdSend: true });
+    await f.disconnectWallet();
+    await f.finishSend();
+    assert.equal(f.payment().submissionError, undefined);
+    await f.discover();
+    assert.equal(f.payment().status, 'Valid');
+    assert.deepEqual(f.counts, { signs: 1, sends: 1, transfers: 1 });
+});
+
+test('reset ignores a previous invoice send failure', async t => {
+    const f = await fixture(t, { outcome: 'lost-response', holdSend: true });
+    await act(async () => f.payment().reset());
+    await f.finishSend();
+    assert.equal(f.payment().status, 'New');
+    assert.equal(f.payment().reference, undefined);
+    assert.equal(f.payment().submissionError, undefined);
+    assert.deepEqual(f.counts, { signs: 1, sends: 1, transfers: 1 });
+});
+
+test('a confirmed invoice ignores a later send failure', async t => {
+    const f = await fixture(t, { outcome: 'lost-response', holdSend: true });
+    await f.discover();
+    assert.equal(f.payment().status, 'Valid');
+    await f.finishSend();
+    assert.equal(f.payment().submissionError, undefined);
+    assert.equal(f.payment().status, 'Valid');
+    assert.deepEqual(f.counts, { signs: 1, sends: 1, transfers: 1 });
+});
+
+test('unmounting during a send does not resubmit when its response fails', async t => {
+    const f = await fixture(t, { outcome: 'lost-response', holdSend: true });
+    await f.unmount();
+    await f.finishSend();
+    assert.deepEqual(f.counts, { signs: 1, sends: 1, transfers: 1 });
+    assert.deepEqual(f.balances(), [9_000_000n, 1_000_000n]);
+});
