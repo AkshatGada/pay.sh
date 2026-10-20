@@ -6,6 +6,8 @@
 use pay_core::client::receipt::{ReceiptProtocol, decode_response_receipt};
 use rmcp::schemars::{self, JsonSchema};
 use serde::Serialize;
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::{cell::Cell, collections::HashSet, fmt};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -38,7 +40,10 @@ impl ReceiptEvidence {
             return Self::Missing;
         };
         // Do not silently pick one of multiple claims, or decode unbounded input.
-        if receipts.next().is_some() || value.len() > MAX_HEADER_BYTES {
+        if receipts.next().is_some()
+            || value.len() > MAX_HEADER_BYTES
+            || header_has_duplicate_json_keys(value)
+        {
             return Self::InvalidOrAmbiguous;
         }
         let Some(decoded) = decode_response_receipt(headers) else {
@@ -90,6 +95,78 @@ pub(super) enum Verification {
 pub(super) enum Protocol {
     Mpp,
     X402,
+}
+
+// Inspect the wire representation before the shared decoder materializes a
+// Value, which would discard repeated keys and silently choose the last claim.
+fn header_has_duplicate_json_keys(value: &str) -> bool {
+    let value = value.trim();
+    has_duplicate_json_keys(value.as_bytes())
+        || pay_kit::mpp::base64url_decode(value).is_ok_and(|bytes| has_duplicate_json_keys(&bytes))
+}
+
+fn has_duplicate_json_keys(bytes: &[u8]) -> bool {
+    let duplicate = Cell::new(false);
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    // Consume the complete document even after finding a duplicate. Malformed
+    // JSON must retain the shared decoder's existing opaque fallback behavior.
+    JsonKeyScan(&duplicate).deserialize(&mut decoder).is_ok()
+        && decoder.end().is_ok()
+        && duplicate.get()
+}
+
+#[derive(Clone, Copy)]
+struct JsonKeyScan<'a>(&'a Cell<bool>);
+
+impl<'de> DeserializeSeed<'de> for JsonKeyScan<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
+        decoder.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for JsonKeyScan<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                self.0.set(true);
+            }
+            map.next_value_seed(self)?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<(), S::Error> {
+        while sequence.next_element_seed(self)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 fn identifiers_are_unambiguous(value: &serde_json::Value) -> bool {
@@ -150,6 +227,66 @@ mod tests {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<Vec<_>>();
         serde_json::to_value(ReceiptEvidence::from_headers(&headers)).unwrap()
+    }
+
+    #[test]
+    fn repeated_json_keys_are_rejected_before_value_decoding() {
+        let payloads = [
+            r#"{"success":false,"success":true,"transaction":"ref"}"#,
+            r#"{"success":true,"success":false,"transaction":"ref"}"#,
+            r#"{"transaction":"first","transaction":"second"}"#,
+            r#"{"success":true,"network":"first","network":"second"}"#,
+            r#"{"success":true,"receipt":{"transaction":"first","transaction":"second"}}"#,
+            r#"{"success":true,"settlement":{"signature":"first"},"settlement":{"signature":"second"}}"#,
+            r#"{"success":true,"\u0073uccess":false,"transaction":"ref"}"#,
+            r#"{"success":false,"success":false}"#,
+            r#"{"success":true,"extension":[{"key":null,"key":false}]}"#,
+        ];
+        for payload in payloads {
+            let mut encodings = vec![payload.to_string()];
+            for engine in [
+                general_purpose::STANDARD,
+                general_purpose::STANDARD_NO_PAD,
+                general_purpose::URL_SAFE,
+                general_purpose::URL_SAFE_NO_PAD,
+            ] {
+                encodings.push(engine.encode(payload));
+            }
+            for header in ["Payment-Response", "X-Payment-Response"] {
+                for value in &encodings {
+                    assert_eq!(
+                        evidence(&[(header, value)]),
+                        json!({"state":"invalid_or_ambiguous"}),
+                        "{header}: {payload}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_scan_preserves_valid_values_and_opaque_fallback() {
+        let payload =
+            r#"{"success":false,"extension":[{"key":1},{"key":2}],"text":"{\"key\":1,\"key\":2}"}"#;
+        for value in [
+            payload.to_string(),
+            general_purpose::URL_SAFE_NO_PAD.encode(payload),
+        ] {
+            assert_eq!(
+                evidence(&[("Payment-Response", &value)]),
+                json!({"state":"merchant_reported", "verification":"unverified",
+                    "protocol":"x402", "merchant_reported_success":false})
+            );
+        }
+        for payload in [r#"{"a":1,"a":2} trailing"#, r#"{"a":1,"a":2,"#] {
+            let encoded = general_purpose::URL_SAFE_NO_PAD.encode(payload);
+            assert!(!has_duplicate_json_keys(payload.as_bytes()));
+            assert_eq!(
+                evidence(&[("Payment-Response", &encoded)]),
+                json!({"state":"merchant_reported", "verification":"unverified",
+                    "protocol":"x402", "merchant_reported_success":null,"reference":encoded})
+            );
+        }
     }
 
     #[test]

@@ -476,6 +476,23 @@ fn non_receipt_and_conflicting_json_is_invalid_on_the_mcp_wire() {
 }
 
 #[test]
+fn repeated_json_keys_are_invalid_on_the_mcp_wire() {
+    for payload in [
+        r#"{"success":false,"success":true,"transaction":"ref"}"#,
+        r#"{"success":true,"success":false,"transaction":"ref"}"#,
+        r#"{"transaction":"first","transaction":"second"}"#,
+        r#"{"success":true,"receipt":{"transaction":"first","transaction":"second"}}"#,
+    ] {
+        for value in [payload.to_string(), STANDARD.encode(payload)] {
+            let mut case = HttpCase::new(200, "text/plain", b"unchanged response");
+            case.headers = vec![("Payment-Response".into(), value)];
+            case.receipt = Some(json!({"state":"invalid_or_ambiguous"}));
+            assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+        }
+    }
+}
+
+#[test]
 fn proxy_environment_is_ignored() {
     let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     proxy.set_nonblocking(true).unwrap();
