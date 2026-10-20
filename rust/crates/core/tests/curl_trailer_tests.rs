@@ -3,12 +3,36 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use pay_core::client::receipt::decode_response_receipt;
 use pay_core::runner::RunOutcome;
+
+/// Re-enter just this test with automatic protocol selection, without mutating
+/// the environment shared by other tests in this process. Returns true in the
+/// parent, whose caller must leave the fixture body to the isolated child.
+fn rerun_without_protocol_override(test_name: &str) -> bool {
+    const WORKER: &str = "PAY_CURL_TRAILER_TEST_WORKER";
+    if std::env::var(WORKER).ok().as_deref() == Some(test_name) {
+        return false;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture", "--color", "never"])
+        .env(WORKER, test_name)
+        .env_remove("PAY_PROTOCOL_ENFORCED")
+        .output()
+        .expect("start isolated curl fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed;"),
+        "isolated fixture {test_name} failed or did not run:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
 
 fn mpp_header() -> String {
     let request = serde_json::json!({
@@ -101,6 +125,9 @@ fn run_fixture(responses: impl FnOnce(&str) -> Vec<String>) -> (RunOutcome, Stri
 
 #[test]
 fn curl_control_without_trailers_recognizes_mpp() {
+    if rerun_without_protocol_override("curl_control_without_trailers_recognizes_mpp") {
+        return;
+    }
     let (outcome, url) = run_fixture(|_| {
         vec![response(
             "402 Payment Required",
@@ -115,6 +142,9 @@ fn curl_control_without_trailers_recognizes_mpp() {
 
 #[test]
 fn curl_chunked_402_with_trailers_recognizes_mpp() {
+    if rerun_without_protocol_override("curl_chunked_402_with_trailers_recognizes_mpp") {
+        return;
+    }
     let (outcome, url) = run_fixture(|_| {
         vec![response(
             "402 Payment Required",
@@ -137,6 +167,9 @@ fn curl_chunked_402_with_trailers_recognizes_mpp() {
 
 #[test]
 fn curl_chunked_402_with_trailers_recognizes_x402() {
+    if rerun_without_protocol_override("curl_chunked_402_with_trailers_recognizes_x402") {
+        return;
+    }
     let (outcome, url) = run_fixture(|url| {
         let offer = serde_json::json!({
             "x402Version": 2,
@@ -168,6 +201,10 @@ fn curl_chunked_402_with_trailers_recognizes_x402() {
 
 #[test]
 fn curl_redirect_trailers_do_not_hide_the_final_mpp_challenge() {
+    if rerun_without_protocol_override("curl_redirect_trailers_do_not_hide_the_final_mpp_challenge")
+    {
+        return;
+    }
     let (outcome, url) = run_fixture(|url| {
         vec![
             response(
@@ -192,6 +229,10 @@ fn curl_redirect_trailers_do_not_hide_the_final_mpp_challenge() {
 
 #[test]
 fn curl_success_with_trailers_preserves_the_response_receipt() {
+    if rerun_without_protocol_override("curl_success_with_trailers_preserves_the_response_receipt")
+    {
+        return;
+    }
     let receipt = STANDARD.encode(
         serde_json::json!({
             "success": true, "transaction": "offline-fixture-signature", "network": "solana:devnet"
